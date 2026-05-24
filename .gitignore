@@ -1,0 +1,24 @@
+# Editor configs
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Python ignore files
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Datasets
+/data/
+
+# Intermediate files
+/temp
+/temp_code/
+/temp_config/
+/workspaces
+/cache
+/analysis
+/artifacts
+*.pkl
+*.ckpt
+log.*
