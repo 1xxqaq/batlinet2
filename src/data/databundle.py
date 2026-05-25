@@ -5,11 +5,17 @@ from src.data.transformation.base import BaseDataTransformation
 
 
 class Dataset:
-    def __init__(self, feature: torch.Tensor, label: torch.Tensor):
+    def __init__(self,
+                 feature: torch.Tensor,
+                 label: torch.Tensor,
+                 metadata: list = None):
         assert len(feature) == len(label), (len(feature), len(label))
+        if metadata is not None:
+            assert len(metadata) == len(label), (len(metadata), len(label))
 
         self.label = label
         self.feature = feature
+        self.metadata = metadata
 
     def __len__(self):
         return len(self.label)
@@ -36,6 +42,8 @@ class DataBundle:
                  train_label: torch.Tensor,
                  test_feature: torch.Tensor,
                  test_label: torch.Tensor,
+                 train_metadata: list = None,
+                 test_metadata: list = None,
                  feature_transformation: BaseDataTransformation = None,
                  label_transformation: BaseDataTransformation = None):
         # Convert the dtype
@@ -58,8 +66,8 @@ class DataBundle:
             test_label = self.label_transformation.transform(test_label)
 
         # Build datasets
-        self.train_data = Dataset(train_feature, train_label)
-        self.test_data = Dataset(test_feature, test_label)
+        self.train_data = Dataset(train_feature, train_label, train_metadata)
+        self.test_data = Dataset(test_feature, test_label, test_metadata)
 
     def to(self, device: str):
         self.train_data = self.train_data.to(device)

@@ -63,9 +63,27 @@ class Task:
         test_features = test_features[test_mask]
         train_labels = train_labels[train_mask]
         test_labels = test_labels[test_mask]
+        train_metadata = [
+            {
+                'cell_id': cell.cell_id,
+                'source_path': str(path),
+            }
+            for cell, path, keep in zip(train_cells, train_list, train_mask.tolist())
+            if keep
+        ]
+        test_metadata = [
+            {
+                'cell_id': cell.cell_id,
+                'source_path': str(path),
+            }
+            for cell, path, keep in zip(test_cells, test_list, test_mask.tolist())
+            if keep
+        ]
 
         dataset = DataBundle(
             train_features, train_labels, test_features, test_labels,
+            train_metadata=train_metadata,
+            test_metadata=test_metadata,
             feature_transformation=self.feature_transformation,
             label_transformation=self.label_transformation
         )

@@ -263,7 +263,9 @@ class BatLiNetRULPredictor(NNModel):
             self.link_latest_checkpoint(latest)
 
     @torch.no_grad()
-    def predict(self, dataset: DataBundle) -> torch.Tensor:
+    def predict(self,
+                dataset: DataBundle,
+                return_diagnostics: bool = False) -> torch.Tensor:
         self.eval()
         # Build a cycle diff dataset
         test_dataset = self.build_cycle_diff_dataset(dataset.test_data)
@@ -271,6 +273,13 @@ class BatLiNetRULPredictor(NNModel):
             test_dataset, self.test_batch_size, shuffle=False)
         fixed_indices = self.load_fixed_test_support_indices(dataset)
         predictions = []
+        diagnostics = {
+            'y_ori': [],
+            'y_sup': [],
+            'y_sup_agg': [],
+            'support_index': [],
+            'support_weight': [],
+        } if return_diagnostics else None
         offset = 0
         for indx, data_batch in enumerate(ori_loader):
             x, y, raw_x = data_batch.values()
@@ -278,12 +287,25 @@ class BatLiNetRULPredictor(NNModel):
             if fixed_indices is not None:
                 batch_fixed_indices = fixed_indices[offset:offset + len(x)]
                 offset += len(x)
-            sup_x, sup_y = self.get_support_set(
+            sup_x, sup_y, sup_indx = self.get_support_set(
                 raw_x,
                 dataset.train_data.feature,
                 dataset.train_data.label,
-                fixed_indices=batch_fixed_indices)
-            predictions.append(self.forward(x, y, sup_x, sup_y))
+                fixed_indices=batch_fixed_indices,
+                return_indices=True)
+            if return_diagnostics:
+                y_ori, y_sup, y_sup_agg, weight = self.compute_prediction_components(
+                    x, sup_x, sup_y)
+                pred = (1. - self.alpha) * y_ori + self.alpha * y_sup_agg
+                predictions.append(pred)
+                diagnostics['y_ori'].append(y_ori)
+                diagnostics['y_sup'].append(y_sup)
+                diagnostics['y_sup_agg'].append(y_sup_agg)
+                diagnostics['support_index'].append(sup_indx)
+                if weight is not None:
+                    diagnostics['support_weight'].append(weight)
+            else:
+                predictions.append(self.forward(x, y, sup_x, sup_y))
         if self.return_pointwise_predictions:
             predictions = (
                 torch.cat([x[0] for x in predictions]),
@@ -291,7 +313,21 @@ class BatLiNetRULPredictor(NNModel):
             )
         else:
             predictions = torch.cat(predictions)
-        return predictions
+        if not return_diagnostics:
+            return predictions
+
+        support_weight = None
+        if diagnostics['support_weight']:
+            support_weight = torch.cat(diagnostics['support_weight'])
+
+        diagnostics = {
+            'y_ori': torch.cat(diagnostics['y_ori']),
+            'y_sup': torch.cat(diagnostics['y_sup']),
+            'y_sup_agg': torch.cat(diagnostics['y_sup_agg']),
+            'support_index': torch.cat(diagnostics['support_index']),
+            'support_weight': support_weight,
+        }
+        return predictions, diagnostics
 
     @torch.no_grad()
     def build_cycle_diff_dataset(self, dataset: Dataset):
@@ -310,7 +346,12 @@ class BatLiNetRULPredictor(NNModel):
         return DiffDataset(feature, raw_feature, dataset.label)
 
     @torch.no_grad()
-    def get_support_set(self, x, sup_feat, sup_label, fixed_indices=None):
+    def get_support_set(self,
+                        x,
+                        sup_feat,
+                        sup_label,
+                        fixed_indices=None,
+                        return_indices: bool = False):
         if self.features_to_drop is not None:
             mask = [i for i in range(sup_feat.size(1))
                     if i not in self.features_to_drop]
@@ -332,6 +373,8 @@ class BatLiNetRULPredictor(NNModel):
         feature = x.unsqueeze(1) - sup_feat[flat_indx].view(B, -1, C, H, W)
         label = sup_label[flat_indx].view(B, -1)
         feature = self._clean_feature(feature)
+        if return_indices:
+            return feature, label, indx.view(B, -1)
         return feature, label
 
     def load_fixed_test_support_indices(self, dataset: DataBundle):
