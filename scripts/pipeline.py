@@ -213,8 +213,8 @@ def main(config_path: str,
                         'test_support_size': configs['model'].get('test_support_size'),
                     },
                     'metadata': {
-                        'train_cells': dataset.train_data.metadata,
-                        'test_cells': dataset.test_data.metadata,
+                        'train_cells': getattr(dataset.train_data, 'metadata', None),
+                        'test_cells': getattr(dataset.test_data, 'metadata', None),
                     },
                 }
                 if diagnostics is not None:
