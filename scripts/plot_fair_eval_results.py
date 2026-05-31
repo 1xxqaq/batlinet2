@@ -1,6 +1,8 @@
 import argparse
+import os
 from pathlib import Path
 
+from matplotlib import font_manager
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,17 +30,35 @@ def parse_args():
         default="batlinet_supervised_weighted",
         help="候选方法名称，需与分析脚本输出列名一致。",
     )
+    parser.add_argument(
+        "--font-path",
+        default=None,
+        help="可选中文字体文件路径，例如 NotoSansCJK-Regular.ttc。也可用 BATLINET_FONT_PATH 环境变量指定。",
+    )
     return parser.parse_args()
 
 
-def setup_matplotlib():
-    plt.rcParams["font.sans-serif"] = [
+def setup_matplotlib(font_path: str = None):
+    font_names = [
         "Microsoft YaHei",
         "SimHei",
         "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "WenQuanYi Micro Hei",
         "Arial Unicode MS",
         "DejaVu Sans",
     ]
+
+    font_path = font_path or os.environ.get("BATLINET_FONT_PATH")
+    if font_path:
+        font_file = Path(font_path).expanduser()
+        if not font_file.exists():
+            raise FileNotFoundError(f"指定的字体文件不存在：{font_file}")
+        font_manager.fontManager.addfont(str(font_file))
+        font_prop = font_manager.FontProperties(fname=str(font_file))
+        font_names.insert(0, font_prop.get_name())
+
+    plt.rcParams["font.sans-serif"] = font_names
     plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -423,7 +443,7 @@ def plot_weight_error_alignment(
 
 def main():
     args = parse_args()
-    setup_matplotlib()
+    setup_matplotlib(args.font_path)
 
     analysis_dir = Path(args.analysis_dir)
     table_dir = analysis_dir / "tables"
