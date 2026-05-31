@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from tqdm import tqdm
@@ -56,9 +57,13 @@ class BatLiNetRULPredictor(NNModel):
                  support_aggregation: str = 'original',
                  score_head_type: str = 'linear',
                  score_hidden_channels: int = None,
+                 score_dropout: float = 0.0,
+                 score_input_mode: str = 'relation',
                  score_temperature: float = 1.0,
                  teacher_temperature: float = 1.0,
                  score_loss_weight: float = 0.0,
+                 ranking_loss_weight: float = 0.0,
+                 ranking_error_margin: float = 0.0,
                  warmup_epochs: int = 0,
                  fixed_test_support_index_path: str = None,
                  filter_cycles: bool = True,
@@ -88,11 +93,22 @@ class BatLiNetRULPredictor(NNModel):
             raise ValueError('teacher_temperature must be positive.')
         if score_loss_weight < 0:
             raise ValueError('score_loss_weight must be non-negative.')
+        if ranking_loss_weight < 0:
+            raise ValueError('ranking_loss_weight must be non-negative.')
+        if ranking_error_margin < 0:
+            raise ValueError('ranking_error_margin must be non-negative.')
         if warmup_epochs < 0:
             raise ValueError('warmup_epochs must be non-negative.')
+        if score_dropout < 0 or score_dropout >= 1:
+            raise ValueError('score_dropout must be in [0, 1).')
+        if score_input_mode not in ('relation', 'relation_prediction_label'):
+            raise ValueError(f'Unknown score_input_mode: {score_input_mode}')
+        self.score_input_mode = score_input_mode
         self.score_temperature = score_temperature
         self.teacher_temperature = teacher_temperature
         self.score_loss_weight = score_loss_weight
+        self.ranking_loss_weight = ranking_loss_weight
+        self.ranking_error_margin = ranking_error_margin
         self.warmup_epochs = warmup_epochs
         self.fixed_test_support_index_path = fixed_test_support_index_path
         self._fixed_test_support_index = None
@@ -116,9 +132,15 @@ class BatLiNetRULPredictor(NNModel):
             kernel_size, act_fn)
         # Shared regressor without bias
         self.fc = nn.Linear(channels, 1, bias=False)
-        if self.support_aggregation in ('learned_weighted', 'supervised_weighted'):
+        if self.support_aggregation in (
+            'learned_weighted',
+            'supervised_weighted',
+            'supervised_weighted_ranked',
+        ):
+            score_input_dim = self.get_score_input_dim()
             self.score_head = build_score_head(
-                self.channels, score_head_type, score_hidden_channels)
+                score_input_dim, score_head_type, score_hidden_channels,
+                score_dropout)
         elif self.support_aggregation not in ('original', 'mean', 'median'):
             raise ValueError(
                 f'Unknown support_aggregation: {self.support_aggregation}')
@@ -132,7 +154,7 @@ class BatLiNetRULPredictor(NNModel):
                support_label: torch.Tensor,
                return_loss: bool = False,
                epoch: int = None):
-        y_ori, y_sup, y_sup_agg, weight = self.compute_prediction_components(
+        y_ori, y_sup, y_sup_agg, weight, score = self.compute_prediction_components(
             feature, support_feature, support_label, epoch=epoch)
 
         if self.return_pointwise_predictions:
@@ -144,12 +166,22 @@ class BatLiNetRULPredictor(NNModel):
                 self.alpha * mse(y_sup_agg, label)
             ])
             if (
-                self.support_aggregation == 'supervised_weighted'
+                self.support_aggregation in (
+                    'supervised_weighted',
+                    'supervised_weighted_ranked',
+                )
                 and weight is not None
                 and self.score_loss_weight > 0
             ):
                 loss = loss + self.score_loss_weight * \
                     self.score_supervision_loss(y_sup, label, weight)
+            if (
+                self.support_aggregation == 'supervised_weighted_ranked'
+                and score is not None
+                and self.ranking_loss_weight > 0
+            ):
+                loss = loss + self.ranking_loss_weight * \
+                    self.score_ranking_loss(y_sup, label, score)
             return loss
 
         return (1. - self.alpha) * y_ori + self.alpha * y_sup_agg
@@ -168,38 +200,79 @@ class BatLiNetRULPredictor(NNModel):
         y_ori = self.fc(x_ori.view(B, self.channels)).view(-1)
         y_sup = self.fc(x_sup).view(B, S)
         y_sup += support_label.view(B, S)
-        y_sup_agg, weight = self.aggregate_support_predictions(
-            x_sup, y_sup, epoch=epoch)
-        return y_ori, y_sup, y_sup_agg, weight
+        y_sup_agg, weight, score = self.aggregate_support_predictions(
+            x_sup, y_sup, y_ori, support_label, epoch=epoch)
+        return y_ori, y_sup, y_sup_agg, weight, score
 
-    def aggregate_support_predictions(self, x_sup, y_sup, epoch=None):
+    def aggregate_support_predictions(self,
+                                      x_sup,
+                                      y_sup,
+                                      y_ori,
+                                      support_label,
+                                      epoch=None):
         if (
-            self.support_aggregation in ('learned_weighted', 'supervised_weighted')
+            self.support_aggregation in (
+                'learned_weighted',
+                'supervised_weighted',
+                'supervised_weighted_ranked',
+            )
             and self.use_weighted_aggregation(epoch)
         ):
-            score = self.score_head(x_sup).squeeze(-1)
-            score = score / self.score_temperature
-            weight = torch.softmax(score, dim=1)
-            return (weight * y_sup).sum(1).view(-1), weight
+            score_input = self.build_score_input(
+                x_sup, y_sup, y_ori, support_label)
+            score = self.score_head(score_input).squeeze(-1)
+            weight = torch.softmax(score / self.score_temperature, dim=1)
+            return (weight * y_sup).sum(1).view(-1), weight, score
 
         if self.support_aggregation == 'mean':
-            return y_sup.mean(1).view(-1), None
+            return y_sup.mean(1).view(-1), None, None
 
         if self.support_aggregation == 'median':
-            return y_sup.median(1)[0].view(-1), None
+            return y_sup.median(1)[0].view(-1), None, None
 
         if self.training:
-            return y_sup.mean(1).view(-1), None
+            return y_sup.mean(1).view(-1), None, None
 
-        return y_sup.median(1)[0].view(-1), None
+        return y_sup.median(1)[0].view(-1), None, None
 
     def use_weighted_aggregation(self, epoch=None):
-        if self.support_aggregation != 'supervised_weighted':
+        if self.support_aggregation not in (
+            'supervised_weighted',
+            'supervised_weighted_ranked',
+        ):
             return True
         current_epoch = self._current_epoch if epoch is None else epoch
         if current_epoch is None:
             return True
         return current_epoch >= self.warmup_epochs
+
+    def get_score_input_dim(self):
+        if self.score_input_mode == 'relation':
+            return self.channels
+        # y_sup, y_ori, y_sup-y_ori, |y_sup-y_ori|,
+        # support_label, support_label-y_ori, |support_label-y_ori|
+        return self.channels + 7
+
+    def build_score_input(self, x_sup, y_sup, y_ori, support_label):
+        if self.score_input_mode == 'relation':
+            return x_sup
+
+        B, S, _ = x_sup.size()
+        y_sup_input = y_sup.detach().unsqueeze(-1)
+        y_ori_input = y_ori.detach().view(B, 1, 1).expand(-1, S, -1)
+        support_label_input = support_label.detach().view(B, S, 1)
+        y_sup_delta = y_sup_input - y_ori_input
+        support_label_delta = support_label_input - y_ori_input
+        scalar_features = [
+            y_sup_input,
+            y_ori_input,
+            y_sup_delta,
+            y_sup_delta.abs(),
+            support_label_input,
+            support_label_delta,
+            support_label_delta.abs(),
+        ]
+        return torch.cat([x_sup, *scalar_features], dim=-1)
 
     def score_supervision_loss(self, y_sup, label, weight):
         with torch.no_grad():
@@ -211,6 +284,20 @@ class BatLiNetRULPredictor(NNModel):
         log_teacher = torch.log(teacher_weight)
         log_weight = torch.log(torch.clamp(weight, min=1e-8))
         return (teacher_weight * (log_teacher - log_weight)).sum(1).mean()
+
+    def score_ranking_loss(self, y_sup, label, score):
+        with torch.no_grad():
+            error = (y_sup.detach() - label.view(-1, 1)).abs()
+            error_i = error.unsqueeze(2)
+            error_j = error.unsqueeze(1)
+            better_pair = error_i + self.ranking_error_margin < error_j
+
+        if not better_pair.any():
+            return score.sum() * 0.
+
+        score_gap = score.unsqueeze(2) - score.unsqueeze(1)
+        pair_loss = F.softplus(-score_gap)
+        return pair_loss[better_pair].mean()
 
     def fit(self, dataset: DataBundle, timestamp: str):
         self.train()
@@ -294,7 +381,7 @@ class BatLiNetRULPredictor(NNModel):
                 fixed_indices=batch_fixed_indices,
                 return_indices=True)
             if return_diagnostics:
-                y_ori, y_sup, y_sup_agg, weight = self.compute_prediction_components(
+                y_ori, y_sup, y_sup_agg, weight, _ = self.compute_prediction_components(
                     x, sup_x, sup_y)
                 pred = (1. - self.alpha) * y_ori + self.alpha * y_sup_agg
                 predictions.append(pred)
@@ -465,7 +552,10 @@ def remove_glitches(data, width=25, threshold=3):
     return data
 
 
-def build_score_head(input_dim, score_head_type, score_hidden_channels):
+def build_score_head(input_dim,
+                     score_head_type,
+                     score_hidden_channels,
+                     score_dropout=0.0):
     if score_head_type == 'linear':
         return nn.Linear(input_dim, 1)
     if score_head_type == 'mlp':
@@ -473,6 +563,18 @@ def build_score_head(input_dim, score_head_type, score_hidden_channels):
         return nn.Sequential(
             nn.Linear(input_dim, score_hidden_channels),
             nn.ReLU(),
+            nn.Linear(score_hidden_channels, 1)
+        )
+    if score_head_type == 'mlp_ln_gelu':
+        score_hidden_channels = score_hidden_channels or max(input_dim, 1)
+        return nn.Sequential(
+            nn.Linear(input_dim, score_hidden_channels),
+            nn.LayerNorm(score_hidden_channels),
+            nn.GELU(),
+            nn.Dropout(score_dropout),
+            nn.Linear(score_hidden_channels, score_hidden_channels),
+            nn.GELU(),
+            nn.Dropout(score_dropout),
             nn.Linear(score_hidden_channels, 1)
         )
     raise ValueError(f'Unknown score_head_type: {score_head_type}')
