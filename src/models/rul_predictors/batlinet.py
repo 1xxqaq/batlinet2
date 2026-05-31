@@ -101,7 +101,11 @@ class BatLiNetRULPredictor(NNModel):
             raise ValueError('warmup_epochs must be non-negative.')
         if score_dropout < 0 or score_dropout >= 1:
             raise ValueError('score_dropout must be in [0, 1).')
-        if score_input_mode not in ('relation', 'relation_prediction_label'):
+        if score_input_mode not in (
+            'relation',
+            'relation_prediction_label',
+            'relation_support_prediction_label',
+        ):
             raise ValueError(f'Unknown score_input_mode: {score_input_mode}')
         self.score_input_mode = score_input_mode
         self.score_temperature = score_temperature
@@ -136,6 +140,7 @@ class BatLiNetRULPredictor(NNModel):
             'learned_weighted',
             'supervised_weighted',
             'supervised_weighted_ranked',
+            'supervised_weighted_fusion_ranked',
         ):
             score_input_dim = self.get_score_input_dim()
             self.score_head = build_score_head(
@@ -169,19 +174,23 @@ class BatLiNetRULPredictor(NNModel):
                 self.support_aggregation in (
                     'supervised_weighted',
                     'supervised_weighted_ranked',
+                    'supervised_weighted_fusion_ranked',
                 )
                 and weight is not None
                 and self.score_loss_weight > 0
             ):
                 loss = loss + self.score_loss_weight * \
-                    self.score_supervision_loss(y_sup, label, weight)
+                    self.score_supervision_loss(y_ori, y_sup, label, weight)
             if (
-                self.support_aggregation == 'supervised_weighted_ranked'
+                self.support_aggregation in (
+                    'supervised_weighted_ranked',
+                    'supervised_weighted_fusion_ranked',
+                )
                 and score is not None
                 and self.ranking_loss_weight > 0
             ):
                 loss = loss + self.ranking_loss_weight * \
-                    self.score_ranking_loss(y_sup, label, score)
+                    self.score_ranking_loss(y_ori, y_sup, label, score)
             return loss
 
         return (1. - self.alpha) * y_ori + self.alpha * y_sup_agg
@@ -215,6 +224,7 @@ class BatLiNetRULPredictor(NNModel):
                 'learned_weighted',
                 'supervised_weighted',
                 'supervised_weighted_ranked',
+                'supervised_weighted_fusion_ranked',
             )
             and self.use_weighted_aggregation(epoch)
         ):
@@ -239,6 +249,7 @@ class BatLiNetRULPredictor(NNModel):
         if self.support_aggregation not in (
             'supervised_weighted',
             'supervised_weighted_ranked',
+            'supervised_weighted_fusion_ranked',
         ):
             return True
         current_epoch = self._current_epoch if epoch is None else epoch
@@ -249,6 +260,9 @@ class BatLiNetRULPredictor(NNModel):
     def get_score_input_dim(self):
         if self.score_input_mode == 'relation':
             return self.channels
+        if self.score_input_mode == 'relation_support_prediction_label':
+            # y_sup, support_label, y_sup-support_label, |y_sup-support_label|
+            return self.channels + 4
         # y_sup, y_ori, y_sup-y_ori, |y_sup-y_ori|,
         # support_label, support_label-y_ori, |support_label-y_ori|
         return self.channels + 7
@@ -259,8 +273,18 @@ class BatLiNetRULPredictor(NNModel):
 
         B, S, _ = x_sup.size()
         y_sup_input = y_sup.detach().unsqueeze(-1)
-        y_ori_input = y_ori.detach().view(B, 1, 1).expand(-1, S, -1)
         support_label_input = support_label.detach().view(B, S, 1)
+        if self.score_input_mode == 'relation_support_prediction_label':
+            support_prediction_delta = y_sup_input - support_label_input
+            scalar_features = [
+                y_sup_input,
+                support_label_input,
+                support_prediction_delta,
+                support_prediction_delta.abs(),
+            ]
+            return torch.cat([x_sup, *scalar_features], dim=-1)
+
+        y_ori_input = y_ori.detach().view(B, 1, 1).expand(-1, S, -1)
         y_sup_delta = y_sup_input - y_ori_input
         support_label_delta = support_label_input - y_ori_input
         scalar_features = [
@@ -274,9 +298,11 @@ class BatLiNetRULPredictor(NNModel):
         ]
         return torch.cat([x_sup, *scalar_features], dim=-1)
 
-    def score_supervision_loss(self, y_sup, label, weight):
+    def score_supervision_loss(self, y_ori, y_sup, label, weight):
         with torch.no_grad():
-            error = (y_sup.detach() - label.view(-1, 1)).abs()
+            reference_prediction = self.teacher_reference_prediction(
+                y_ori, y_sup)
+            error = (reference_prediction - label.view(-1, 1)).abs()
             teacher_weight = torch.softmax(
                 -error / self.teacher_temperature, dim=1)
             teacher_weight = torch.clamp(teacher_weight, min=1e-8)
@@ -285,9 +311,11 @@ class BatLiNetRULPredictor(NNModel):
         log_weight = torch.log(torch.clamp(weight, min=1e-8))
         return (teacher_weight * (log_teacher - log_weight)).sum(1).mean()
 
-    def score_ranking_loss(self, y_sup, label, score):
+    def score_ranking_loss(self, y_ori, y_sup, label, score):
         with torch.no_grad():
-            error = (y_sup.detach() - label.view(-1, 1)).abs()
+            reference_prediction = self.teacher_reference_prediction(
+                y_ori, y_sup)
+            error = (reference_prediction - label.view(-1, 1)).abs()
             error_i = error.unsqueeze(2)
             error_j = error.unsqueeze(1)
             better_pair = error_i + self.ranking_error_margin < error_j
@@ -298,6 +326,12 @@ class BatLiNetRULPredictor(NNModel):
         score_gap = score.unsqueeze(2) - score.unsqueeze(1)
         pair_loss = F.softplus(-score_gap)
         return pair_loss[better_pair].mean()
+
+    def teacher_reference_prediction(self, y_ori, y_sup):
+        if self.support_aggregation == 'supervised_weighted_fusion_ranked':
+            y_ori = y_ori.detach().view(-1, 1)
+            return (1. - self.alpha) * y_ori + self.alpha * y_sup.detach()
+        return y_sup.detach()
 
     def fit(self, dataset: DataBundle, timestamp: str):
         self.train()
