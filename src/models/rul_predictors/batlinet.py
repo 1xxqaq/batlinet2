@@ -64,6 +64,10 @@ class BatLiNetRULPredictor(NNModel):
                  score_loss_weight: float = 0.0,
                  ranking_loss_weight: float = 0.0,
                  ranking_error_margin: float = 0.0,
+                 context_hidden_channels: int = None,
+                 context_num_layers: int = 1,
+                 context_num_heads: int = 4,
+                 context_dropout: float = 0.0,
                  warmup_epochs: int = 0,
                  fixed_test_support_index_path: str = None,
                  filter_cycles: bool = True,
@@ -97,6 +101,12 @@ class BatLiNetRULPredictor(NNModel):
             raise ValueError('ranking_loss_weight must be non-negative.')
         if ranking_error_margin < 0:
             raise ValueError('ranking_error_margin must be non-negative.')
+        if context_num_layers <= 0:
+            raise ValueError('context_num_layers must be positive.')
+        if context_num_heads <= 0:
+            raise ValueError('context_num_heads must be positive.')
+        if context_dropout < 0 or context_dropout >= 1:
+            raise ValueError('context_dropout must be in [0, 1).')
         if warmup_epochs < 0:
             raise ValueError('warmup_epochs must be non-negative.')
         if score_dropout < 0 or score_dropout >= 1:
@@ -105,6 +115,7 @@ class BatLiNetRULPredictor(NNModel):
             'relation',
             'relation_prediction_label',
             'relation_support_prediction_label',
+            'context_relation_support_prediction_label',
         ):
             raise ValueError(f'Unknown score_input_mode: {score_input_mode}')
         self.score_input_mode = score_input_mode
@@ -141,11 +152,13 @@ class BatLiNetRULPredictor(NNModel):
             'supervised_weighted',
             'supervised_weighted_ranked',
             'supervised_weighted_fusion_ranked',
+            'supervised_weighted_context_ranked',
         ):
             score_input_dim = self.get_score_input_dim()
             self.score_head = build_score_head(
                 score_input_dim, score_head_type, score_hidden_channels,
-                score_dropout)
+                score_dropout, context_hidden_channels, context_num_layers,
+                context_num_heads, context_dropout)
         elif self.support_aggregation not in ('original', 'mean', 'median'):
             raise ValueError(
                 f'Unknown support_aggregation: {self.support_aggregation}')
@@ -175,6 +188,7 @@ class BatLiNetRULPredictor(NNModel):
                     'supervised_weighted',
                     'supervised_weighted_ranked',
                     'supervised_weighted_fusion_ranked',
+                    'supervised_weighted_context_ranked',
                 )
                 and weight is not None
                 and self.score_loss_weight > 0
@@ -185,6 +199,7 @@ class BatLiNetRULPredictor(NNModel):
                 self.support_aggregation in (
                     'supervised_weighted_ranked',
                     'supervised_weighted_fusion_ranked',
+                    'supervised_weighted_context_ranked',
                 )
                 and score is not None
                 and self.ranking_loss_weight > 0
@@ -210,11 +225,12 @@ class BatLiNetRULPredictor(NNModel):
         y_sup = self.fc(x_sup).view(B, S)
         y_sup += support_label.view(B, S)
         y_sup_agg, weight, score = self.aggregate_support_predictions(
-            x_sup, y_sup, y_ori, support_label, epoch=epoch)
+            x_sup, x_ori, y_sup, y_ori, support_label, epoch=epoch)
         return y_ori, y_sup, y_sup_agg, weight, score
 
     def aggregate_support_predictions(self,
                                       x_sup,
+                                      x_ori,
                                       y_sup,
                                       y_ori,
                                       support_label,
@@ -225,11 +241,12 @@ class BatLiNetRULPredictor(NNModel):
                 'supervised_weighted',
                 'supervised_weighted_ranked',
                 'supervised_weighted_fusion_ranked',
+                'supervised_weighted_context_ranked',
             )
             and self.use_weighted_aggregation(epoch)
         ):
             score_input = self.build_score_input(
-                x_sup, y_sup, y_ori, support_label)
+                x_sup, x_ori, y_sup, y_ori, support_label)
             score = self.score_head(score_input).squeeze(-1)
             weight = torch.softmax(score / self.score_temperature, dim=1)
             return (weight * y_sup).sum(1).view(-1), weight, score
@@ -250,6 +267,7 @@ class BatLiNetRULPredictor(NNModel):
             'supervised_weighted',
             'supervised_weighted_ranked',
             'supervised_weighted_fusion_ranked',
+            'supervised_weighted_context_ranked',
         ):
             return True
         current_epoch = self._current_epoch if epoch is None else epoch
@@ -263,11 +281,14 @@ class BatLiNetRULPredictor(NNModel):
         if self.score_input_mode == 'relation_support_prediction_label':
             # y_sup, support_label, y_sup-support_label, |y_sup-support_label|
             return self.channels + 4
+        if self.score_input_mode == 'context_relation_support_prediction_label':
+            # x_ori plus relation-support scalar features.
+            return self.channels * 2 + 4
         # y_sup, y_ori, y_sup-y_ori, |y_sup-y_ori|,
         # support_label, support_label-y_ori, |support_label-y_ori|
         return self.channels + 7
 
-    def build_score_input(self, x_sup, y_sup, y_ori, support_label):
+    def build_score_input(self, x_sup, x_ori, y_sup, y_ori, support_label):
         if self.score_input_mode == 'relation':
             return x_sup
 
@@ -283,6 +304,17 @@ class BatLiNetRULPredictor(NNModel):
                 support_prediction_delta.abs(),
             ]
             return torch.cat([x_sup, *scalar_features], dim=-1)
+
+        if self.score_input_mode == 'context_relation_support_prediction_label':
+            x_ori_input = x_ori.view(B, 1, self.channels).expand(-1, S, -1)
+            support_prediction_delta = y_sup_input - support_label_input
+            scalar_features = [
+                y_sup_input,
+                support_label_input,
+                support_prediction_delta,
+                support_prediction_delta.abs(),
+            ]
+            return torch.cat([x_sup, x_ori_input, *scalar_features], dim=-1)
 
         y_ori_input = y_ori.detach().view(B, 1, 1).expand(-1, S, -1)
         y_sup_delta = y_sup_input - y_ori_input
@@ -328,7 +360,10 @@ class BatLiNetRULPredictor(NNModel):
         return pair_loss[better_pair].mean()
 
     def teacher_reference_prediction(self, y_ori, y_sup):
-        if self.support_aggregation == 'supervised_weighted_fusion_ranked':
+        if self.support_aggregation in (
+            'supervised_weighted_fusion_ranked',
+            'supervised_weighted_context_ranked',
+        ):
             y_ori = y_ori.detach().view(-1, 1)
             return (1. - self.alpha) * y_ori + self.alpha * y_sup.detach()
         return y_sup.detach()
@@ -589,7 +624,11 @@ def remove_glitches(data, width=25, threshold=3):
 def build_score_head(input_dim,
                      score_head_type,
                      score_hidden_channels,
-                     score_dropout=0.0):
+                     score_dropout=0.0,
+                     context_hidden_channels=None,
+                     context_num_layers=1,
+                     context_num_heads=4,
+                     context_dropout=0.0):
     if score_head_type == 'linear':
         return nn.Linear(input_dim, 1)
     if score_head_type == 'mlp':
@@ -611,7 +650,56 @@ def build_score_head(input_dim,
             nn.Dropout(score_dropout),
             nn.Linear(score_hidden_channels, 1)
         )
+    if score_head_type == 'transformer_set':
+        hidden_channels = context_hidden_channels or score_hidden_channels
+        hidden_channels = hidden_channels or max(input_dim, 1)
+        return SetContextScoreHead(
+            input_dim=input_dim,
+            hidden_channels=hidden_channels,
+            num_layers=context_num_layers,
+            num_heads=context_num_heads,
+            dropout=context_dropout)
     raise ValueError(f'Unknown score_head_type: {score_head_type}')
+
+
+class SetContextScoreHead(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 hidden_channels,
+                 num_layers,
+                 num_heads,
+                 dropout):
+        super().__init__()
+        if hidden_channels % num_heads != 0:
+            raise ValueError(
+                'context hidden_channels must be divisible by num_heads.')
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_channels,
+            nhead=num_heads,
+            dim_feedforward=hidden_channels * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True)
+        self.context_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers)
+        self.score_proj = nn.Sequential(
+            nn.LayerNorm(hidden_channels),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 1),
+        )
+
+    def forward(self, score_input):
+        token = self.input_proj(score_input)
+        token = self.context_encoder(token)
+        return self.score_proj(token)
 
 
 def build_module(

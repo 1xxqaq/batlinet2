@@ -268,7 +268,10 @@ def build_representative_samples(
     return pd.concat([improve[cols], stable[cols], regress[cols]], ignore_index=True)
 
 
-def build_candidate_support_detail_rows(candidate_objs: Dict[int, dict]) -> pd.DataFrame:
+def build_candidate_support_detail_rows(
+    candidate_objs: Dict[int, dict],
+    alpha: float = 0.5,
+) -> pd.DataFrame:
     rows = []
     for seed in sorted(candidate_objs):
         obj = candidate_objs[seed]
@@ -289,6 +292,17 @@ def build_candidate_support_detail_rows(candidate_objs: Dict[int, dict]) -> pd.D
         for test_idx, test_cell in enumerate(test_meta):
             for rank_idx, train_idx in enumerate(support_index[test_idx].tolist()):
                 train_cell = train_meta[int(train_idx)]
+                support_prediction = None if y_sup is None else float(y_sup[test_idx, rank_idx])
+                support_fused_prediction = None
+                support_fused_abs_error = None
+                if y_ori is not None and support_prediction is not None:
+                    support_fused_prediction = (
+                        (1.0 - alpha) * float(y_ori[test_idx])
+                        + alpha * support_prediction
+                    )
+                    support_fused_abs_error = abs(
+                        support_fused_prediction - float(target[test_idx])
+                    )
                 rows.append(
                     {
                         "seed": seed,
@@ -305,7 +319,9 @@ def build_candidate_support_detail_rows(candidate_objs: Dict[int, dict]) -> pd.D
                         "support_source_path": train_cell["source_path"],
                         "support_source_name": get_source_name(train_cell["source_path"]),
                         "support_weight": float(support_weight[test_idx, rank_idx]),
-                        "support_prediction": None if y_sup is None else float(y_sup[test_idx, rank_idx]),
+                        "support_prediction": support_prediction,
+                        "support_fused_prediction": support_fused_prediction,
+                        "support_fused_abs_error": support_fused_abs_error,
                     }
                 )
     return pd.DataFrame(rows)
@@ -334,6 +350,8 @@ def annotate_columns(df: pd.DataFrame) -> pd.DataFrame:
         "support_source_name": "support_source_name（参考电池来源）",
         "support_weight": "support_weight（参考权重）",
         "support_prediction": "support_prediction（单参考预测）",
+        "support_fused_prediction": "support_fused_prediction（单参考融合后预测）",
+        "support_fused_abs_error": "support_fused_abs_error（单参考融合后绝对误差）",
         "selected_count": "selected_count（被选次数）",
         "mean_weight": "mean_weight（平均权重）",
         "max_weight": "max_weight（最大权重）",
@@ -355,7 +373,7 @@ def annotate_columns(df: pd.DataFrame) -> pd.DataFrame:
         "oracle_top5_mean_abs_error": "oracle_top5_mean_abs_error（oracle前五均值绝对误差）",
         "best_support_rank": "best_support_rank（最低误差参考序号）",
         "best_support_prediction": "best_support_prediction（最低误差单参考预测）",
-        "best_support_abs_error": "best_support_abs_error（最低单参考绝对误差）",
+        "best_support_abs_error": "best_support_abs_error（最低参考融合后绝对误差）",
         "spearman_weight_error": "spearman_weight_error（权重与单参考误差Spearman相关）",
         "pearson_weight_error": "pearson_weight_error（权重与单参考误差Pearson相关）",
         "weight_entropy": "weight_entropy（权重归一化熵）",
@@ -363,6 +381,16 @@ def annotate_columns(df: pd.DataFrame) -> pd.DataFrame:
         "highest_weight_rank": "highest_weight_rank（最高权重参考序号）",
         "highest_weight_error_rank": "highest_weight_error_rank（最高权重参考的误差排名）",
         "highest_weight_abs_error": "highest_weight_abs_error（最高权重参考绝对误差）",
+        "spearman_weight_fused_error": "spearman_weight_fused_error（权重与融合后误差Spearman相关）",
+        "pearson_weight_fused_error": "pearson_weight_fused_error（权重与融合后误差Pearson相关）",
+        "best_fused_weight": "best_fused_weight（最低融合后误差参考权重）",
+        "highest_weight_fused_error_rank": "highest_weight_fused_error_rank（最高权重参考的融合后误差排名）",
+        "highest_weight_fused_abs_error": "highest_weight_fused_abs_error（最高权重参考融合后绝对误差）",
+        "best_support_fused_abs_error": "best_support_fused_abs_error（最低融合后绝对误差）",
+        "median_support_fused_abs_error": "median_support_fused_abs_error（融合后误差中位数）",
+        "highest_weight_in_top1_fused_error": "highest_weight_in_top1_fused_error（最高权重是否融合后误差第1）",
+        "highest_weight_in_top3_fused_error": "highest_weight_in_top3_fused_error（最高权重是否融合后误差前3）",
+        "highest_weight_in_top5_fused_error": "highest_weight_in_top5_fused_error（最高权重是否融合后误差前5）",
         "median_support_abs_error": "median_support_abs_error（单参考误差中位数）",
         "highest_weight_in_top1_error": "highest_weight_in_top1_error（最高权重是否误差第1）",
         "highest_weight_in_top3_error": "highest_weight_in_top3_error（最高权重是否误差前3）",
@@ -370,10 +398,16 @@ def annotate_columns(df: pd.DataFrame) -> pd.DataFrame:
         "sample_count": "sample_count（样本数）",
         "mean_spearman_weight_error": "mean_spearman_weight_error（平均Spearman相关）",
         "median_spearman_weight_error": "median_spearman_weight_error（中位Spearman相关）",
+        "mean_spearman_weight_fused_error": "mean_spearman_weight_fused_error（权重与融合后误差平均Spearman相关）",
+        "median_spearman_weight_fused_error": "median_spearman_weight_fused_error（权重与融合后误差中位Spearman相关）",
         "positive_spearman_fraction": "positive_spearman_fraction（正相关样本占比）",
+        "positive_spearman_fused_fraction": "positive_spearman_fused_fraction（融合后误差正相关样本占比）",
         "top1_error_hit_rate": "top1_error_hit_rate（最高权重命中最低误差比例）",
         "top3_error_hit_rate": "top3_error_hit_rate（最高权重命中误差前3比例）",
         "top5_error_hit_rate": "top5_error_hit_rate（最高权重命中误差前5比例）",
+        "top1_fused_error_hit_rate": "top1_fused_error_hit_rate（最高权重命中最低融合后误差比例）",
+        "top3_fused_error_hit_rate": "top3_fused_error_hit_rate（最高权重命中融合后误差前3比例）",
+        "top5_fused_error_hit_rate": "top5_fused_error_hit_rate（最高权重命中融合后误差前5比例）",
         "mean_weight_entropy": "mean_weight_entropy（平均权重归一化熵）",
         "mean_max_weight": "mean_max_weight（平均最大权重）",
         "top1_count": "top1_count（rank0次数）",
@@ -494,11 +528,16 @@ def build_oracle_aggregation_tables(
         y_ori = float(group["y_ori"].iloc[0])
         final_prediction = float(group["final_prediction"].iloc[0])
         support_predictions = group["support_prediction"].to_numpy(dtype=float)
-        support_errors = np.abs(support_predictions - target)
-        order = np.argsort(support_errors)
 
         def fuse(support_value):
             return (1.0 - alpha) * y_ori + alpha * float(support_value)
+
+        support_fused_predictions = np.array(
+            [fuse(value) for value in support_predictions],
+            dtype=float,
+        )
+        support_fused_errors = np.abs(support_fused_predictions - target)
+        order = np.argsort(support_fused_errors)
 
         row = {
             "seed": int(seed),
@@ -516,7 +555,7 @@ def build_oracle_aggregation_tables(
             "oracle_top5_mean_final": fuse(np.mean(support_predictions[order[:5]])),
             "best_support_rank": int(order[0]),
             "best_support_prediction": float(support_predictions[order[0]]),
-            "best_support_abs_error": float(support_errors[order[0]]),
+            "best_support_abs_error": float(support_fused_errors[order[0]]),
         }
         for _, prediction_col in methods[1:]:
             row[prediction_col.replace("_final", "_abs_error")] = abs(
@@ -562,10 +601,22 @@ def build_weight_error_alignment_tables(
         predictions = group["support_prediction"].to_numpy(dtype=float)
         target = float(group["target"].iloc[0])
         errors = np.abs(predictions - target)
+        if (
+            "support_fused_abs_error" in group.columns
+            and group["support_fused_abs_error"].notna().all()
+        ):
+            fused_errors = group["support_fused_abs_error"].to_numpy(dtype=float)
+        else:
+            fused_errors = errors
         best_error = float(errors.min())
+        best_fused_error = float(fused_errors.min())
         highest_weight_index = int(np.argmax(weights))
         error_order = np.argsort(errors)
         error_rank = int(np.where(error_order == highest_weight_index)[0][0]) + 1
+        fused_error_order = np.argsort(fused_errors)
+        fused_error_rank = int(
+            np.where(fused_error_order == highest_weight_index)[0][0]
+        ) + 1
         entropy = -float(np.sum(weights * np.log(weights + 1e-12)) / np.log(len(weights)))
 
         rows.append(
@@ -580,17 +631,30 @@ def build_weight_error_alignment_tables(
                     rank_average(errors),
                 ),
                 "pearson_weight_error": safe_corr(weights, errors),
+                "spearman_weight_fused_error": safe_corr(
+                    rank_average(weights),
+                    rank_average(fused_errors),
+                ),
+                "pearson_weight_fused_error": safe_corr(weights, fused_errors),
                 "weight_entropy": entropy,
                 "max_weight": float(weights.max()),
                 "best_weight": float(weights[error_order[0]]),
+                "best_fused_weight": float(weights[fused_error_order[0]]),
                 "highest_weight_rank": highest_weight_index,
                 "highest_weight_error_rank": error_rank,
+                "highest_weight_fused_error_rank": fused_error_rank,
                 "highest_weight_abs_error": float(errors[highest_weight_index]),
+                "highest_weight_fused_abs_error": float(fused_errors[highest_weight_index]),
                 "best_support_abs_error": best_error,
+                "best_support_fused_abs_error": best_fused_error,
                 "median_support_abs_error": float(np.median(errors)),
+                "median_support_fused_abs_error": float(np.median(fused_errors)),
                 "highest_weight_in_top1_error": int(error_rank <= 1),
                 "highest_weight_in_top3_error": int(error_rank <= 3),
                 "highest_weight_in_top5_error": int(error_rank <= 5),
+                "highest_weight_in_top1_fused_error": int(fused_error_rank <= 1),
+                "highest_weight_in_top3_fused_error": int(fused_error_rank <= 3),
+                "highest_weight_in_top5_fused_error": int(fused_error_rank <= 5),
             }
         )
 
@@ -601,10 +665,18 @@ def build_weight_error_alignment_tables(
             sample_count=("test_index", "size"),
             mean_spearman_weight_error=("spearman_weight_error", "mean"),
             median_spearman_weight_error=("spearman_weight_error", "median"),
+            mean_spearman_weight_fused_error=("spearman_weight_fused_error", "mean"),
+            median_spearman_weight_fused_error=("spearman_weight_fused_error", "median"),
             positive_spearman_fraction=("spearman_weight_error", lambda x: float((x > 0).mean())),
+            positive_spearman_fused_fraction=(
+                "spearman_weight_fused_error", lambda x: float((x > 0).mean())
+            ),
             top1_error_hit_rate=("highest_weight_in_top1_error", "mean"),
             top3_error_hit_rate=("highest_weight_in_top3_error", "mean"),
             top5_error_hit_rate=("highest_weight_in_top5_error", "mean"),
+            top1_fused_error_hit_rate=("highest_weight_in_top1_fused_error", "mean"),
+            top3_fused_error_hit_rate=("highest_weight_in_top3_fused_error", "mean"),
+            top5_fused_error_hit_rate=("highest_weight_in_top5_fused_error", "mean"),
             mean_weight_entropy=("weight_entropy", "mean"),
             mean_max_weight=("max_weight", "mean"),
         )
@@ -615,10 +687,18 @@ def build_weight_error_alignment_tables(
         "sample_count": int(alignment["test_index"].count()),
         "mean_spearman_weight_error": alignment["spearman_weight_error"].mean(),
         "median_spearman_weight_error": alignment["spearman_weight_error"].median(),
+        "mean_spearman_weight_fused_error": alignment["spearman_weight_fused_error"].mean(),
+        "median_spearman_weight_fused_error": alignment["spearman_weight_fused_error"].median(),
         "positive_spearman_fraction": float((alignment["spearman_weight_error"] > 0).mean()),
+        "positive_spearman_fused_fraction": float(
+            (alignment["spearman_weight_fused_error"] > 0).mean()
+        ),
         "top1_error_hit_rate": alignment["highest_weight_in_top1_error"].mean(),
         "top3_error_hit_rate": alignment["highest_weight_in_top3_error"].mean(),
         "top5_error_hit_rate": alignment["highest_weight_in_top5_error"].mean(),
+        "top1_fused_error_hit_rate": alignment["highest_weight_in_top1_fused_error"].mean(),
+        "top3_fused_error_hit_rate": alignment["highest_weight_in_top3_fused_error"].mean(),
+        "top5_fused_error_hit_rate": alignment["highest_weight_in_top5_fused_error"].mean(),
         "mean_weight_entropy": alignment["weight_entropy"].mean(),
         "mean_max_weight": alignment["max_weight"].mean(),
     }
