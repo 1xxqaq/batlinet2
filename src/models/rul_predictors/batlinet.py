@@ -64,6 +64,9 @@ class BatLiNetRULPredictor(NNModel):
                  score_loss_weight: float = 0.0,
                  ranking_loss_weight: float = 0.0,
                  ranking_error_margin: float = 0.0,
+                 residual_loss_weight: float = 0.0,
+                 residual_filter_keep_ratio: float = 0.5,
+                 residual_filter_detach_input: bool = True,
                  context_hidden_channels: int = None,
                  context_num_layers: int = 1,
                  context_num_heads: int = 4,
@@ -101,6 +104,10 @@ class BatLiNetRULPredictor(NNModel):
             raise ValueError('ranking_loss_weight must be non-negative.')
         if ranking_error_margin < 0:
             raise ValueError('ranking_error_margin must be non-negative.')
+        if residual_loss_weight < 0:
+            raise ValueError('residual_loss_weight must be non-negative.')
+        if residual_filter_keep_ratio <= 0 or residual_filter_keep_ratio > 1:
+            raise ValueError('residual_filter_keep_ratio must be in (0, 1].')
         if context_num_layers <= 0:
             raise ValueError('context_num_layers must be positive.')
         if context_num_heads <= 0:
@@ -124,6 +131,9 @@ class BatLiNetRULPredictor(NNModel):
         self.score_loss_weight = score_loss_weight
         self.ranking_loss_weight = ranking_loss_weight
         self.ranking_error_margin = ranking_error_margin
+        self.residual_loss_weight = residual_loss_weight
+        self.residual_filter_keep_ratio = residual_filter_keep_ratio
+        self.residual_filter_detach_input = residual_filter_detach_input
         self.warmup_epochs = warmup_epochs
         self.fixed_test_support_index_path = fixed_test_support_index_path
         self._fixed_test_support_index = None
@@ -153,6 +163,7 @@ class BatLiNetRULPredictor(NNModel):
             'supervised_weighted_ranked',
             'supervised_weighted_fusion_ranked',
             'supervised_weighted_context_ranked',
+            'rrn_residual_filter',
         ):
             score_input_dim = self.get_score_input_dim()
             self.score_head = build_score_head(
@@ -183,6 +194,13 @@ class BatLiNetRULPredictor(NNModel):
                 (1. - self.alpha) * mse(y_ori, label),
                 self.alpha * mse(y_sup_agg, label)
             ])
+            if (
+                self.support_aggregation == 'rrn_residual_filter'
+                and score is not None
+                and self.residual_loss_weight > 0
+            ):
+                loss = loss + self.residual_loss_weight * \
+                    self.residual_prediction_loss(y_ori, y_sup, label, score)
             if (
                 self.support_aggregation in (
                     'supervised_weighted',
@@ -236,6 +254,23 @@ class BatLiNetRULPredictor(NNModel):
                                       support_label,
                                       epoch=None):
         if (
+            self.support_aggregation == 'rrn_residual_filter'
+        ):
+            score_input = self.build_score_input(
+                x_sup, x_ori, y_sup, y_ori, support_label)
+            if self.residual_filter_detach_input:
+                score_input = score_input.detach()
+            predicted_residual = F.softplus(
+                self.score_head(score_input).squeeze(-1))
+            if self.use_weighted_aggregation(epoch):
+                y_sup_agg, weight = self.residual_filter_aggregate(
+                    y_sup, predicted_residual)
+                return y_sup_agg, weight, predicted_residual
+            if self.training:
+                return y_sup.mean(1).view(-1), None, predicted_residual
+            return y_sup.median(1)[0].view(-1), None, predicted_residual
+
+        if (
             self.support_aggregation in (
                 'learned_weighted',
                 'supervised_weighted',
@@ -268,6 +303,7 @@ class BatLiNetRULPredictor(NNModel):
             'supervised_weighted_ranked',
             'supervised_weighted_fusion_ranked',
             'supervised_weighted_context_ranked',
+            'rrn_residual_filter',
         ):
             return True
         current_epoch = self._current_epoch if epoch is None else epoch
@@ -330,6 +366,17 @@ class BatLiNetRULPredictor(NNModel):
         ]
         return torch.cat([x_sup, *scalar_features], dim=-1)
 
+    def residual_filter_aggregate(self, y_sup, predicted_residual):
+        B, S = y_sup.size()
+        keep_count = int(round(S * self.residual_filter_keep_ratio))
+        keep_count = min(S, max(1, keep_count))
+        keep_index = torch.topk(
+            predicted_residual, k=keep_count, dim=1, largest=False)[1]
+        selected_y_sup = torch.gather(y_sup, 1, keep_index)
+        weight = torch.zeros_like(y_sup)
+        weight.scatter_(1, keep_index, 1.0 / keep_count)
+        return selected_y_sup.median(1)[0].view(B), weight
+
     def score_supervision_loss(self, y_ori, y_sup, label, weight):
         with torch.no_grad():
             reference_prediction = self.teacher_reference_prediction(
@@ -359,10 +406,19 @@ class BatLiNetRULPredictor(NNModel):
         pair_loss = F.softplus(-score_gap)
         return pair_loss[better_pair].mean()
 
+    def residual_prediction_loss(self, y_ori, y_sup, label, predicted_residual):
+        with torch.no_grad():
+            reference_prediction = (1. - self.alpha) * \
+                y_ori.detach().view(-1, 1) + self.alpha * y_sup.detach()
+            target_residual = (
+                reference_prediction - label.detach().view(-1, 1)).abs()
+        return F.smooth_l1_loss(predicted_residual, target_residual)
+
     def teacher_reference_prediction(self, y_ori, y_sup):
         if self.support_aggregation in (
             'supervised_weighted_fusion_ranked',
             'supervised_weighted_context_ranked',
+            'rrn_residual_filter',
         ):
             y_ori = y_ori.detach().view(-1, 1)
             return (1. - self.alpha) * y_ori + self.alpha * y_sup.detach()
@@ -435,6 +491,7 @@ class BatLiNetRULPredictor(NNModel):
             'y_sup_agg': [],
             'support_index': [],
             'support_weight': [],
+            'support_score': [],
         } if return_diagnostics else None
         offset = 0
         for indx, data_batch in enumerate(ori_loader):
@@ -450,7 +507,7 @@ class BatLiNetRULPredictor(NNModel):
                 fixed_indices=batch_fixed_indices,
                 return_indices=True)
             if return_diagnostics:
-                y_ori, y_sup, y_sup_agg, weight, _ = self.compute_prediction_components(
+                y_ori, y_sup, y_sup_agg, weight, score = self.compute_prediction_components(
                     x, sup_x, sup_y)
                 pred = (1. - self.alpha) * y_ori + self.alpha * y_sup_agg
                 predictions.append(pred)
@@ -460,6 +517,8 @@ class BatLiNetRULPredictor(NNModel):
                 diagnostics['support_index'].append(sup_indx)
                 if weight is not None:
                     diagnostics['support_weight'].append(weight)
+                if score is not None:
+                    diagnostics['support_score'].append(score)
             else:
                 predictions.append(self.forward(x, y, sup_x, sup_y))
         if self.return_pointwise_predictions:
@@ -475,6 +534,9 @@ class BatLiNetRULPredictor(NNModel):
         support_weight = None
         if diagnostics['support_weight']:
             support_weight = torch.cat(diagnostics['support_weight'])
+        support_score = None
+        if diagnostics['support_score']:
+            support_score = torch.cat(diagnostics['support_score'])
 
         diagnostics = {
             'y_ori': torch.cat(diagnostics['y_ori']),
@@ -482,6 +544,7 @@ class BatLiNetRULPredictor(NNModel):
             'y_sup_agg': torch.cat(diagnostics['y_sup_agg']),
             'support_index': torch.cat(diagnostics['support_index']),
             'support_weight': support_weight,
+            'support_score': support_score,
         }
         return predictions, diagnostics
 
